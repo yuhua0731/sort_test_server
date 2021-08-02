@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 import time
-import sys
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
-import struct
+from datetime import datetime, timezone
 import socket
 import crcelk
 from threading import Thread
 from bitstring import BitArray
 
-global message_send
-global message_type  # distinguish special commands in recv thread
-global flag_timeout
-global current_position
+global flag_timeout, waiting_udp, current_position
+current_position = 0
 
 UDPClientSocket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
 UDPClientSocket.settimeout(3)
@@ -47,7 +43,7 @@ udp_logger = setup_logger("rf_udp", "rf_udp.log")
 
 # log with timestamp
 def log_with_time(logger_name, string):
-    logger_name.info("{} {}".format(datetime.now().isoformat(), string))
+    logger_name.info("{} {}".format(datetime.now(timezone.utc).astimezone().isoformat(), string))
     return
 
 
@@ -65,7 +61,7 @@ def form(message):
             message[5:6].hex(), message[6:7].hex(), message[7:11].hex())
         print_format += " | abs pos: {} | CRC: {}".format(
             message[7:11].hex(), message[11:15].hex())
-    elif message[5] == 0x02:  # moving message
+    elif message[5] in [0x02, 0x0A]:  # moving & moving_read message
         print_format += " | cmd: {} | pos: {} | velocity: {}".format(
             message[5:6].hex(), message[6:10].hex(), message[10:14].hex()
         )
@@ -144,8 +140,6 @@ def log_timeout(information):
 def recv(message_send, message_type):
     global waiting_udp
     global current_position
-    waiting_udp = True
-    current_position = 0
     # start different receiving modes according to message type
     # global variable: message_send, message_type
     msgReceive = recv_and_log(
@@ -214,9 +208,9 @@ def recv(message_send, message_type):
                 break
             msgReceive = recv_and_log(msgReceive)
         while abs(
-            int.from_bytes(msgReceive[6: 10],
+            int.from_bytes(msgReceive[6:10],
                            byteorder="little", signed=True) - int.from_bytes(
-                message_send[6: 10],
+                message_send[6:10],
                 byteorder="little", signed=True)) > moving_pre_arrive_count and 0 == msgReceive[16] & 0x01:
             if time.time() > timeout:
                 log_timeout("too much time on moving")
@@ -284,6 +278,14 @@ def recv(message_send, message_type):
     elif message_type == "sensor_state":
         while True:
             msgReceive = recv_and_log(msgReceive)
+    elif message_type == "moving_read":
+        timeout = time.time() + 3
+        while msgReceive[5] != 0x0A:
+            if time.time() > timeout:
+                log_timeout("moving read")
+                break
+            msgReceive = recv_and_log(msgReceive)
+        current_position = int.from_bytes(msgReceive[6:10], byteorder="little", signed=True)
     elif message_type == "config":
         if message_send[6] == 0x40 and msgReceive[6] != 0x43:
             log_error("config write state {}".format(msgReceive[6:7].hex()))
@@ -306,8 +308,9 @@ def encode(data):
 
 # test given message
 def test(message, mess_type):
-    global flag_timeout
+    global flag_timeout, waiting_udp
     flag_timeout = False
+    waiting_udp = True
     # define threads
     trecv = Thread(target=recv, args=(message, mess_type))
     tsend = Thread(target=send, args=(message, mess_type))
@@ -374,6 +377,14 @@ def sensor_state():
     mess_type = "sensor_state"
     log_with_time(udp_logger, "test {}".format(mess_type))
     data = bytearray(b"\x05")
+    return test(encode(data), mess_type)
+
+
+# test moving_read 0x0A
+def moving_read():
+    mess_type = "moving_read"
+    log_with_time(udp_logger, "test {}".format(mess_type))
+    data = bytearray(b"\x0A")
     return test(encode(data), mess_type)
 
 
